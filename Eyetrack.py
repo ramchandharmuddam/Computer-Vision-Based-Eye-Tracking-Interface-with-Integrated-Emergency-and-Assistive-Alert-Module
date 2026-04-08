@@ -1,282 +1,190 @@
-import time
+import tkinter as tk
+from tkinter import ttk
 
 import cv2
-import mediapipe as mp
-import numpy as np
-import pyautogui
-import pyttsx3
+from PIL import Image, ImageTk
 
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True)
+from controller import FaceHandController
 
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 150)    # Speed of speech
-tts_engine.setProperty('volume', 0.9)  # Volume (0.0 to 1.0)
 
-screen_w, screen_h = pyautogui.size()
+class FullScreenApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Face & Hand Controlled Mouse")
+        self.root.geometry("1200x800")
+        self.status_var = tk.StringVar(value="System ready")
+        self.quick_buttons = []
 
-prev_x, prev_y = 0, 0
-smoothening = 6
+        self.setup_ui()
 
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+        self.controller = FaceHandController(
+            callback=self.update_gui,
+            on_long_click=self.handle_button_click
+        )
 
-BLINK_THRESHOLD = 0.20        # EAR below this = eye closed
-long_closure_start = 0
-long_closure_triggered = False
-LONG_CLOSURE_DURATION = 2.0   # seconds to trigger a long‑closure click
-LONG_CLOSURE_ACTION = pyautogui.leftClick   # function (no parentheses)
+        # Schedule updates after window is fully rendered
+        self.root.after(500, self.update_button_rects)
+        self.root.bind("<Configure>", self.on_window_resize)   # update on resize
 
-state = 'idle'
-start_countdown_end = 0
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-nod_count = 0
-nod_state = 'up'               # 'up' or 'down'
-nod_start_time = 0
-NOD_THRESHOLD = 15             # vertical movement (pixels) to count as nod
-NOD_TIMEOUT = 3.0              # seconds to complete 3 nods
+        # Video feed
+        video_frame = ttk.LabelFrame(main_frame, text="Camera Feed", padding="5")
+        video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.video_label = ttk.Label(video_frame)
+        self.video_label.pack(fill=tk.BOTH, expand=True)
 
-lr_state = 'neutral'           # 'neutral', 'left', 'right'
-lr_count = 0
-lr_start_time = 0
-LR_THRESHOLD = 20              # horizontal movement (pixels)
-LR_TIMEOUT = 3.0               # seconds to complete pattern
+        # Control panel
+        control_frame = ttk.Frame(main_frame, width=350)
+        control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10,0))
+        control_frame.pack_propagate(False)
 
-window_name = "Face Mouse Control"
-cv2.namedWindow(window_name)
-VIDEO_WIDTH, VIDEO_HEIGHT = 640, 480
-VIDEO_X, VIDEO_Y = 20, 20
+        # Top buttons
+        btn_frame = ttk.Frame(control_frame)
+        btn_frame.pack(pady=10)
+        self.start_btn = ttk.Button(btn_frame, text="Start", command=self.start_controller)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_controller, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        self.keyboard_btn = ttk.Button(btn_frame, text="Keyboard", command=self.open_keyboard)
+        self.keyboard_btn.pack(side=tk.LEFT, padx=5)
+        self.exit_btn = ttk.Button(btn_frame, text="Exit", command=self.exit_app)
+        self.exit_btn.pack(side=tk.LEFT, padx=5)
 
-BUTTON_WIDTH, BUTTON_HEIGHT = 150, 50
-START_BTN = (700, 50, 850, 100)
-STOP_BTN  = (700, 120, 850, 170)
-CLOSE_BTN = (700, 190, 850, 240)
+        # Status
+        ttk.Label(control_frame, text="Status:", font=('Arial', 12, 'bold')).pack(anchor=tk.W, pady=(20,0))
+        self.status_label = ttk.Label(control_frame, textvariable=self.status_var,
+                                      font=('Arial', 10), foreground='blue')
+        self.status_label.pack(anchor=tk.W, pady=5)
 
-exit_app = False   # when True, program will close
+        # Quick Actions
+        quick_frame = ttk.LabelFrame(control_frame, text="Quick Actions (hover & close eyes)", padding="10")
+        quick_frame.pack(fill=tk.X, pady=10)
 
-def eye_aspect_ratio(landmarks, eye_points, frame_w, frame_h):
-    points = []
-    for p in eye_points:
-        x = int(landmarks[p].x * frame_w)
-        y = int(landmarks[p].y * frame_h)
-        points.append((x, y))
-    v1 = np.linalg.norm(np.array(points[1]) - np.array(points[5]))
-    v2 = np.linalg.norm(np.array(points[2]) - np.array(points[4]))
-    h  = np.linalg.norm(np.array(points[0]) - np.array(points[3]))
-    ear = (v1 + v2) / (2.0 * h)
-    return ear
+        quick_actions = [
+            ("Hungry", "hungry"),
+            ("Thirsty", "thirsty"),
+            ("Help", "help"),
+            ("Take me out", "take me out"),
+            ("Water", "water"),
+            ("Bathroom", "bathroom"),
+            ("Pain", "pain"),
+            ("I need attention", "attention")
+        ]
+        for text, phrase in quick_actions:
+            btn = ttk.Button(quick_frame, text=text, width=15)
+            btn.pack(pady=2)
+            self.quick_buttons.append({
+                'widget': btn,
+                'phrase': phrase,
+                'rect': None
+            })
 
-def mouse_callback(event, x, y, flags, param):
-    global state, start_countdown_end, exit_app
-    if event == cv2.EVENT_LBUTTONDOWN:
-        # Start button
-        if (START_BTN[0] <= x <= START_BTN[2] and
-            START_BTN[1] <= y <= START_BTN[3]):
-            if state != 'active':
-                state = 'active'
-                print("Started by button")
-        # Stop button
-        if (STOP_BTN[0] <= x <= STOP_BTN[2] and
-            STOP_BTN[1] <= y <= STOP_BTN[3]):
-            if state != 'idle':
-                state = 'idle'
-                print("Stopped by button")
-        # Close button
-        if (CLOSE_BTN[0] <= x <= CLOSE_BTN[2] and
-            CLOSE_BTN[1] <= y <= CLOSE_BTN[3]):
-            exit_app = True
-            print("Exit requested")
+        # Test TTS button
+        test_btn = ttk.Button(control_frame, text="Test TTS", command=self.test_tts)
+        test_btn.pack(pady=5)
 
-cv2.setMouseCallback(window_name, mouse_callback)
+        # Instructions
+        instr_frame = ttk.LabelFrame(control_frame, text="How to use", padding="10")
+        instr_frame.pack(fill=tk.BOTH, expand=True, pady=20)
+        instructions = [
+            "• Click START or:",
+            "  - Nod head 3 times",
+            "  - Show open hand",
+            "",
+            "• When ACTIVE:",
+            "  - Move nose to move cursor",
+            "  - Close eyes for 2s to click",
+            "  - Hover over a Quick Action button",
+            "  - Close eyes → button phrase spoken 5x",
+            "",
+            "• To STOP:",
+            "  - Click STOP button",
+            "  - Move head left→right→left",
+            "  - Make a fist",
+            "",
+            "• To open on‑screen keyboard:",
+            "  - Click 'Keyboard' button",
+            "  - OR show both hands fully open",
+            "",
+            "• Press EXIT to close"
+        ]
+        for line in instructions:
+            ttk.Label(instr_frame, text=line, justify=tk.LEFT).pack(anchor=tk.W)
 
-cap = cv2.VideoCapture(0)
+    def update_button_rects(self):
+        """Get screen coordinates of each quick action button."""
+        print("Updating button rects...")
+        for btn_info in self.quick_buttons:
+            widget = btn_info['widget']
+            widget.update_idletasks()
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty()
+            w = widget.winfo_width()
+            h = widget.winfo_height()
+            btn_info['rect'] = (x, y, x + w, y + h)
+            print(f"Button '{btn_info['phrase']}' rect = {btn_info['rect']}")
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    def on_window_resize(self, event):
+        """Update button positions when window is moved/resized."""
+        self.root.after(100, self.update_button_rects)
 
-    frame = cv2.flip(frame, 1)
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb_frame)
+    def handle_button_click(self, x, y):
+        """Called by controller when a long closure happens. Returns True if a quick button was triggered."""
+        print(f"Long click at screen ({x}, {y})")
+        for btn_info in self.quick_buttons:
+            rect = btn_info['rect']
+            if rect:
+                print(f"Checking button '{btn_info['phrase']}' rect {rect}")
+                if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                    phrase = btn_info['phrase']
+                    print(f"Triggering phrase: {phrase}")
+                    self.controller.speak_repeated(phrase, times=5)
+                    return True
+        print("No button hovered.")
+        return False
 
-    frame_h, frame_w, _ = frame.shape
+    def start_controller(self):
+        self.controller.start()
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.status_var.set("Controller started")
 
-    # Create blank canvas for GUI
-    canvas = np.ones((600, 1000, 3), dtype=np.uint8) * 255  # white background
+    def stop_controller(self):
+        self.controller.stop()
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_var.set("Controller stopped")
 
-    # Place video feed
-    video_frame = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT))
-    canvas[VIDEO_Y:VIDEO_Y+VIDEO_HEIGHT, VIDEO_X:VIDEO_X+VIDEO_WIDTH] = video_frame
+    def open_keyboard(self):
+        self.controller.open_keyboard()
 
-    # Draw buttons
-    # Start
-    cv2.rectangle(canvas, (START_BTN[0], START_BTN[1]),
-                  (START_BTN[2], START_BTN[3]), (0, 200, 0), -1)
-    cv2.putText(canvas, "START", (START_BTN[0]+30, START_BTN[1]+35),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-    # Stop
-    cv2.rectangle(canvas, (STOP_BTN[0], STOP_BTN[1]),
-                  (STOP_BTN[2], STOP_BTN[3]), (0, 0, 200), -1)
-    cv2.putText(canvas, "STOP", (STOP_BTN[0]+35, STOP_BTN[1]+35),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-    # Exit
-    cv2.rectangle(canvas, (CLOSE_BTN[0], CLOSE_BTN[1]),
-                  (CLOSE_BTN[2], CLOSE_BTN[3]), (100, 100, 100), -1)
-    cv2.putText(canvas, "EXIT", (CLOSE_BTN[0]+35, CLOSE_BTN[1]+35),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    def test_tts(self):
+        self.controller.speak_repeated("Test voice", times=1)
 
-    # Instructions
-    y0 = 250
-    cv2.putText(canvas, "How to use:", (700, y0), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (0,0,0), 2)
-    instructions = [
-        "1. Click START or nod 3 times to begin",
-        "2. Move head to move cursor",
-        "3. Close eyes for 2 seconds to click",
-        "4. You will hear 'button clicked' when action is performed",
-        "5. To stop: click STOP or move head left-right-left",
-        "6. Click EXIT to close"
-    ]
-    for i, line in enumerate(instructions):
-        y = y0 + 30 + i*25
-        cv2.putText(canvas, line, (700, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (50,50,50), 1)
+    def exit_app(self):
+        self.controller.stop()
+        self.root.quit()
+        self.root.destroy()
 
-    # Status display
-    if state == 'active':
-        cv2.putText(canvas, "STATUS: ACTIVE", (700, 400),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,150,0), 2)
-    elif state == 'starting':
-        remaining = max(0, int(start_countdown_end - time.time()))
-        cv2.putText(canvas, f"STATUS: STARTING in {remaining}s", (700, 400),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,100,0), 2)
-    else:
-        cv2.putText(canvas, "STATUS: IDLE", (700, 400),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150,0,0), 2)
+    def update_gui(self, frame, status_text):
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        video_width = self.video_label.winfo_width()
+        video_height = self.video_label.winfo_height()
+        if video_width > 1 and video_height > 1:
+            img.thumbnail((video_width, video_height), Image.Resampling.LANCZOS)
+        imgtk = ImageTk.PhotoImage(image=img)
+        self.root.after(0, self._display_frame, imgtk, status_text)
 
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            landmarks = face_landmarks.landmark
+    def _display_frame(self, imgtk, status_text):
+        self.video_label.config(image=imgtk)
+        self.video_label.image = imgtk
+        self.status_var.set(status_text)
 
-            # Nose tip for movement & gestures
-            nose = landmarks[1]
-            nose_x = int(nose.x * frame_w)
-            nose_y = int(nose.y * frame_h)
-
-            current_time = time.time()
-
-            if state == 'idle':
-                if 'prev_nose_y' not in locals():
-                    prev_nose_y = nose_y
-
-                diff_y = nose_y - prev_nose_y   # positive = down
-
-                if nod_state == 'up' and diff_y > NOD_THRESHOLD:
-                    nod_state = 'down'
-                    nod_start_time = current_time
-                elif nod_state == 'down' and diff_y < -NOD_THRESHOLD:
-                    nod_count += 1
-                    nod_state = 'up'
-                    nod_start_time = current_time
-
-                # Timeout
-                if current_time - nod_start_time > NOD_TIMEOUT:
-                    nod_count = 0
-                    nod_state = 'up'
-
-                if nod_count >= 3:
-                    state = 'starting'
-                    start_countdown_end = current_time + 5
-                    nod_count = 0
-                    nod_state = 'up'
-                    print("Nod detected: starting in 5 seconds")
-
-                prev_nose_y = nose_y
-
-            if state == 'active':
-                if 'prev_nose_x' not in locals():
-                    prev_nose_x = nose_x
-
-                diff_x = nose_x - prev_nose_x   # positive = right
-
-                if lr_state == 'neutral':
-                    if diff_x < -LR_THRESHOLD:
-                        lr_state = 'left'
-                        lr_count = 1
-                        lr_start_time = current_time
-                    elif diff_x > LR_THRESHOLD:
-                        lr_state = 'right'
-                        lr_count = 1
-                        lr_start_time = current_time
-                elif lr_state == 'left':
-                    if diff_x > LR_THRESHOLD:
-                        lr_state = 'right'
-                        lr_count = 2
-                        lr_start_time = current_time
-                elif lr_state == 'right':
-                    if diff_x < -LR_THRESHOLD:
-                        lr_state = 'left'
-                        lr_count = 3
-                        lr_start_time = current_time
-
-                if lr_count == 3:
-                    state = 'idle'
-                    print("Left‑right‑left detected: stopped")
-                    lr_count = 0
-                    lr_state = 'neutral'
-
-                if current_time - lr_start_time > LR_TIMEOUT:
-                    lr_count = 0
-                    lr_state = 'neutral'
-
-                prev_nose_x = nose_x
-
-            if state == 'active':
-                # ---- Mouse movement ----
-                screen_x = np.interp(nose_x, [100, frame_w-100], [0, screen_w])
-                screen_y = np.interp(nose_y, [100, frame_h-100], [0, screen_h])
-
-                curr_x = prev_x + (screen_x - prev_x) / smoothening
-                curr_y = prev_y + (screen_y - prev_y) / smoothening
-
-                pyautogui.moveTo(curr_x, curr_y)
-                prev_x, prev_y = curr_x, curr_y
-
-                # ---- Eye state detection (both eyes) ----
-                ear_left = eye_aspect_ratio(landmarks, LEFT_EYE, frame_w, frame_h)
-                ear_right = eye_aspect_ratio(landmarks, RIGHT_EYE, frame_w, frame_h)
-                ear = (ear_left + ear_right) / 2.0
-
-                # ---- Long‑closure detection (eyes kept closed) ----
-                if ear < BLINK_THRESHOLD:   # eyes closed
-                    if long_closure_start == 0:
-                        long_closure_start = time.time()
-                        long_closure_triggered = False
-                    else:
-                        # If eyes remain closed beyond LONG_CLOSURE_DURATION, trigger action once
-                        if not long_closure_triggered and (time.time() - long_closure_start) >= LONG_CLOSURE_DURATION:
-                            print("Long closure detected: performing click")
-                            LONG_CLOSURE_ACTION()   # e.g., left click
-                            # Speak feedback
-                            tts_engine.say("button clicked")
-                            tts_engine.runAndWait()
-                            long_closure_triggered = True
-                else:                         # eyes open
-                    long_closure_start = 0
-                    long_closure_triggered = False
-
-    if state == 'starting' and time.time() >= start_countdown_end:
-        state = 'active'
-        print("Countdown finished: now active")
-
-    if exit_app:
-        break
-
-    cv2.imshow(window_name, canvas)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FullScreenApp(root)
+    root.mainloop()
