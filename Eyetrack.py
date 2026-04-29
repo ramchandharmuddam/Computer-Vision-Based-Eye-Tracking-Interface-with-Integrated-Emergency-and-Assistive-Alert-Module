@@ -1,7 +1,10 @@
+import os
 import tkinter as tk
-from tkinter import messagebox, ttk
+from datetime import datetime
+from tkinter import ttk
 
 import cv2
+import openpyxl  # Added for Excel logging
 from PIL import Image, ImageTk
 
 from controller import FaceHandController
@@ -20,6 +23,10 @@ class PremiumApp:
         self.quick_buttons = []
         self.smooth_var = tk.IntVar(value=2)
         self.click_duration_var = tk.DoubleVar(value=2.0)
+        self.excel_file = "tracking_details.xlsx"
+
+        # Initialize the Excel Log
+        self.init_excel_log()
 
         # Setup custom style
         self.setup_styles()
@@ -40,6 +47,34 @@ class PremiumApp:
         # Bind sensitivity changes
         self.smooth_var.trace_add('write', self.update_sensitivity)
         self.click_duration_var.trace_add('write', self.update_click_duration)
+
+    def init_excel_log(self):
+        """Creates the Excel file with headers if it doesn't exist."""
+        if not os.path.exists(self.excel_file):
+            try:
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Action Logs"
+                ws.append(["Date", "Time", "Action"])
+                wb.save(self.excel_file)
+                print(f"Created new tracking file: {self.excel_file}")
+            except Exception as e:
+                print(f"Error creating Excel file: {e}")
+
+    def log_action(self, action):
+        """Appends a new action to the Excel file with the current timestamp."""
+        try:
+            now = datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            time_str = now.strftime("%H:%M:%S")
+            
+            wb = openpyxl.load_workbook(self.excel_file)
+            ws = wb.active
+            ws.append([date_str, time_str, action])
+            wb.save(self.excel_file)
+            print(f"Logged to Excel: {action}")
+        except Exception as e:
+            print(f"Failed to log action to Excel: {e}")
 
     def setup_styles(self):
         style = ttk.Style()
@@ -184,63 +219,57 @@ class PremiumApp:
             w = widget.winfo_width()
             h = widget.winfo_height()
             btn_info['rect'] = (x, y, x + w, y + h)
-            print(f"Button '{btn_info['phrase']}' rect = {btn_info['rect']}")
 
     def on_window_resize(self, event):
         self.root.after(100, self.update_button_rects)
 
     def handle_button_click(self, x, y):
-        print(f"Long click at ({x}, {y})")
         for btn_info in self.quick_buttons:
             rect = btn_info['rect']
             if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
                 phrase = btn_info['phrase']
-                print(f"Triggered: {phrase}")
+                
+                # Speak the phrase
+                self.controller.speak_repeated(phrase, 3)
+
+                # Log to Excel
+                self.log_action(f"Quick Action Triggered: {phrase.capitalize()}")
+
+                # Background email logic
                 if phrase == "emergency":
-                    success = self.controller.send_emergency_email()
-                    if success:
-                        messagebox.showinfo("Emergency Alert", "Emergency email sent successfully!")
-                        self.controller.speak_repeated("Emergency alert sent", 1)
-                    else:
-                        messagebox.showerror("Emergency Alert", "Failed to send email. Check console for details.")
-                        self.controller.speak_repeated("Emergency alert failed", 1)
-                else:
-                    action_name = phrase.capitalize()
-                    messagebox.showinfo("Quick Action", f"{action_name} alert sent!")
-                    # Speak the phrase 3 times (changed from 5)
-                    self.controller.speak_repeated(phrase, 3)
+                    self.controller.send_emergency_email()
+                
                 return True
         return False
 
     def emergency_alert(self):
-        print("Emergency button clicked")
-        success = self.controller.send_emergency_email()
-        if success:
-            messagebox.showinfo("Emergency Alert", "Emergency email sent successfully!")
-            self.controller.speak_repeated("Emergency alert sent", 1)
-        else:
-            messagebox.showerror("Emergency Alert", "Failed to send email. Check internet and email settings.")
-            self.controller.speak_repeated("Emergency alert failed", 1)
+        self.log_action("Emergency Dashboard Button Clicked")
+        self.controller.send_emergency_email()
 
     def start_controller(self):
+        self.log_action("Controller Started")
         self.controller.start()
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.status_var.set("Controller started – move your nose")
 
     def stop_controller(self):
+        self.log_action("Controller Stopped")
         self.controller.stop()
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_var.set("Controller stopped")
 
     def open_keyboard(self):
+        self.log_action("Keyboard Opened")
         self.controller.open_keyboard()
 
     def test_tts(self):
+        self.log_action("Voice Tested")
         self.controller.speak_repeated("Voice test successful", 1)
 
     def exit_app(self):
+        self.log_action("Application Exited")
         self.controller.stop()
         self.root.quit()
         self.root.destroy()
